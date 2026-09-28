@@ -14,6 +14,7 @@ from typing import Generator, Optional
 import cv2
 import numpy as np
 
+from .background import BackgroundFilter
 from .clustering import CrowdClusterer
 from .config import CameraCalibration, PipelineConfig
 from .counting import CountingModule
@@ -25,6 +26,7 @@ from .models import (
     CrowdAlarm,
     CrowdCluster,
     FusedDetection,
+    GroundPoint,
     HeadDetection,
     OcclusionType,
     TrackedPerson,
@@ -91,6 +93,7 @@ class CrowdDensityPipeline:
         """
         self._config = config or PipelineConfig()
         self._is_running = False
+        self._pixel_fallback_warned = False
 
         # Inizializza i moduli
         self._detector = HeadDetector()
@@ -104,6 +107,7 @@ class CrowdDensityPipeline:
             resolution=self._config.density_map_resolution,
         )
         self._clusterer = CrowdClusterer()
+        self._background_filter: Optional[BackgroundFilter] = None
 
     @property
     def config(self) -> PipelineConfig:
@@ -120,15 +124,81 @@ class CrowdDensityPipeline:
         """Accesso al modulo omografico (per calibrazione esterna)."""
         return self._homography
 
+    @property
+    def background_filter(self) -> Optional[BackgroundFilter]:
+        """Accesso al filtro background, o None se non abilitato."""
+        return self._background_filter
+
+    def enable_background_filter(
+        self,
+        warmup_frames: int = 60,
+        diff_threshold: float = 30.0,
+        static_ratio: float = 0.15,
+    ) -> None:
+        """Abilita il filtro background subtraction.
+
+        Le detection in regioni statiche (es. statue) saranno scartate.
+        I primi warmup_frames frame vengono usati per costruire il modello
+        di sfondo; durante quel periodo non vengono emesse detection.
+
+        Args:
+            warmup_frames: Frame per costruire il modello di sfondo.
+            diff_threshold: Soglia di differenza per pixel (0-255).
+            static_ratio: Proporzione minima di pixel cambiati per
+                considerare una detection come persona vera.
+        """
+        self._background_filter = BackgroundFilter(
+            warmup_frames=warmup_frames,
+            diff_threshold=diff_threshold,
+            static_ratio=static_ratio,
+        )
+        logger.info(
+            "Background filter abilitato: warmup=%d frame, "
+            "diff_threshold=%.1f, static_ratio=%.2f",
+            warmup_frames, diff_threshold, static_ratio,
+        )
+
+    def enable_background_filter_from_image(
+        self,
+        image_path: str,
+        diff_threshold: float = 30.0,
+        static_ratio: float = 0.15,
+    ) -> None:
+        """Abilita il filtro usando un modello di sfondo pre-calcolato.
+
+        Nessun warmup necessario: il filtro è attivo dal primo frame.
+
+        Args:
+            image_path: Percorso all'immagine di sfondo.
+            diff_threshold: Soglia di differenza per pixel (0-255).
+            static_ratio: Proporzione minima di pixel cambiati.
+        """
+        self._background_filter = BackgroundFilter.from_image(
+            image_path=image_path,
+            diff_threshold=diff_threshold,
+            static_ratio=static_ratio,
+        )
+
     def _is_homography_calibrated(self) -> bool:
         """Verifica se il modulo omografico ha una matrice valida."""
         return self._homography.homography_matrix is not None
 
-    def _get_scene_bounds(self) -> SceneBounds:
-        """Restituisce i confini della scena o un default ragionevole."""
+    def _get_scene_bounds(self, frame_shape: tuple[int, ...] | None = None) -> SceneBounds:
+        """Restituisce i confini della scena.
+
+        Se l'omografia è calibrata, usa i bounds configurati o un default
+        in metri. Altrimenti, usa le dimensioni del frame in pixel come
+        bounds (fallback pixel-space).
+
+        Args:
+            frame_shape: Shape del frame (H, W, C). Usato per il fallback pixel.
+        """
         bounds = self._homography.scene_bounds
         if bounds is not None:
             return bounds
+        if not self._is_homography_calibrated() and frame_shape is not None:
+            h, w = frame_shape[:2]
+            return (0.0, 0.0, float(w), float(h))
         return _DEFAULT_SCENE_BOUNDS
 
     def process_frame(
@@ -139,14 +209,19 @@ class CrowdDensityPipeline:
     ) -> FrameResult:
         """Esegue la catena completa di elaborazione per un singolo frame.
 
-        Sequenza:
+        Con omografia calibrata (modalità completa):
             1. HeadDetector.detect(frame) → head_detections
-            2. Per ogni head, HomographyModule.image_to_ground(center) → ground_position
-            3. Costruisce FusedDetection (pose=None nel MVP)
-            4. StateMachine.update(frame_id, timestamp, detections) → tracked_persons
-            5. CountingModule.compute_count(tracked_persons) → count_result
-            6. DensityMapGenerator.generate(tracked_persons, scene_bounds) → density_map
-            7. CrowdClusterer.detect_crowds(tracked_persons, config.crowd) → clusters, alarms
+            2. HomographyModule.image_to_ground → ground_position (metri)
+            3. StateMachine.update → tracked_persons (tracking temporale)
+            4. CountingModule.compute_count → count_result
+            5. DensityMapGenerator.generate → density_map
+            6. CrowdClusterer.detect_crowds → clusters, alarms
+
+        Senza omografia (modalità detection-only):
+            1. HeadDetector.detect(frame) → head_detections
+            2. Background filter (se abilitato) → filtra statici
+            3. Conteggio diretto da detection (no tracking)
+            4. Clustering sulle detection del frame corrente (no accumulo)
 
         Args:
             frame: Frame RGB con shape (H, W, 3) e dtype uint8.
@@ -159,21 +234,48 @@ class CrowdDensityPipeline:
         # 1. Rilevamento teste
         head_detections = self._detector.detect(frame)
 
+        # 1b. Filtro background: scarta detection statiche (es. statue)
+        if self._background_filter is not None:
+            if not self._background_filter.is_ready:
+                self._background_filter.feed_frame(frame)
+                head_detections = []
+            else:
+                head_detections = self._background_filter.filter_detections(
+                    frame, head_detections
+                )
+
+        if self._is_homography_calibrated():
+            return self._process_frame_calibrated(
+                frame, head_detections, frame_id, timestamp
+            )
+        else:
+            return self._process_frame_pixel(
+                frame, head_detections, frame_id, timestamp
+            )
+
+    def _process_frame_calibrated(
+        self,
+        frame: np.ndarray,
+        head_detections: list[HeadDetection],
+        frame_id: int,
+        timestamp: float,
+    ) -> FrameResult:
+        """Elaborazione completa con omografia: tracking + counting + clustering in metri."""
         # 2-3. Proiezione omografica e creazione FusedDetection
         fused_detections = self._create_fused_detections(head_detections)
 
-        # 4. Aggiornamento macchina a stati (tracking)
+        # 4. Tracking temporale
         tracked_persons = self._state_machine.update(
             frame_id=frame_id,
             timestamp=timestamp,
             detections=fused_detections,
         )
 
-        # 5. Conteggio persone
+        # 5. Conteggio
         count_result = self._counting.compute_count(tracked_persons)
 
-        # 6. Generazione mappa di densità
-        scene_bounds = self._get_scene_bounds()
+        # 6. Density map
+        scene_bounds = self._get_scene_bounds(frame_shape=frame.shape)
         density_map: Optional[DensityMap] = None
         try:
             density_map = self._density_generator.generate(
@@ -183,13 +285,12 @@ class CrowdDensityPipeline:
         except Exception as e:
             logger.warning("Errore nella generazione della mappa di densità: %s", e)
 
-        # 7. Rilevamento assembramenti (clustering)
+        # 7. Clustering
         clusters, alarms = self._clusterer.detect_crowds(
             persons=tracked_persons,
             config=self._config.crowd,
         )
 
-        # Log allarmi
         for alarm in alarms:
             logger.warning("ALLARME %s: %s", alarm.alarm_level.upper(), alarm.message)
 
@@ -198,6 +299,111 @@ class CrowdDensityPipeline:
             timestamp=timestamp,
             head_detections=head_detections,
             tracked_persons=tracked_persons,
+            count_result=count_result,
+            density_map=density_map,
+            clusters=clusters,
+            alarms=alarms,
+        )
+
+    def _process_frame_pixel(
+        self,
+        frame: np.ndarray,
+        head_detections: list[HeadDetection],
+        frame_id: int,
+        timestamp: float,
+    ) -> FrameResult:
+        """Elaborazione detection-only senza omografia.
+
+        Non usa il tracking temporale per evitare accumulo di persone fantasma.
+        Il conteggio si basa direttamente sulle detection del frame corrente.
+        Il clustering lavora sulle posizioni pixel delle detection correnti.
+        """
+        if not self._pixel_fallback_warned and head_detections:
+            logger.info(
+                "Modalità detection-only (no omografia): conteggio e clustering "
+                "basati sulle detection del frame corrente, senza tracking temporale."
+            )
+            self._pixel_fallback_warned = True
+
+        num_detected = len(head_detections)
+
+        # Conteggio diretto dalle detection
+        count_result = CountResult(
+            frame_count=float(num_detected),
+            occluded_count=0.0,
+            total_count=float(num_detected),
+            confidence_interval=(float(num_detected), float(num_detected)),
+            persons_visible=num_detected,
+            persons_partial=0,
+            persons_occluded=0,
+        )
+
+        # Creare TrackedPerson temporanee per clustering e density map
+        # (solo per il frame corrente, non persistono tra frame)
+        temp_persons: list[TrackedPerson] = []
+        from .models import PersonState
+        for i, det in enumerate(head_detections):
+            gp = GroundPoint(x=det.center.x, y=det.center.y)
+            temp_persons.append(TrackedPerson(
+                person_id=i,
+                state=PersonState.VISIBILE,
+                confidence=det.confidence,
+                ground_position=gp,
+            ))
+
+        # Density map in pixel
+        scene_bounds = self._get_scene_bounds(frame_shape=frame.shape)
+        density_map: Optional[DensityMap] = None
+        try:
+            pixel_density_gen = DensityMapGenerator(
+                resolution=0.5,
+                sigma=25.0,
+            )
+            density_map = pixel_density_gen.generate(
+                persons=temp_persons,
+                scene_bounds=scene_bounds,
+            )
+        except Exception as e:
+            logger.warning("Errore nella generazione della mappa di densità: %s", e)
+
+        # Clustering in pixel
+        clusters: list[CrowdCluster] = []
+        alarms: list[CrowdAlarm] = []
+        if len(temp_persons) >= self._config.crowd.min_cluster_size:
+            from dataclasses import replace
+            import math
+            # La scala pixel/metro dipende dalla scena. Per un frame 1920px
+            # che copre ~12 metri di larghezza: ~160 pixel/metro.
+            pixel_scale = 150.0
+            eps_pixel = self._config.crowd.cluster_radius_meters * pixel_scale
+            min_possible_density = (
+                self._config.crowd.min_cluster_size
+                / (math.pi * eps_pixel * eps_pixel)
+            )
+            pixel_crowd_config = replace(
+                self._config.crowd,
+                cluster_radius_meters=eps_pixel,
+                density_threshold=min_possible_density * 0.9,
+                critical_threshold=min_possible_density * 1.8,
+            )
+            clusters, alarms = self._clusterer.detect_crowds(
+                persons=temp_persons,
+                config=pixel_crowd_config,
+            )
+
+        for alarm in alarms:
+            cluster = alarm.cluster
+            logger.warning(
+                "ALLARME %s: assembramento di %d persone rilevato",
+                alarm.alarm_level.upper(),
+                cluster.person_count,
+            )
+
+        return FrameResult(
+            frame_id=frame_id,
+            timestamp=timestamp,
+            head_detections=head_detections,
+            tracked_persons=temp_persons,
             count_result=count_result,
             density_map=density_map,
             clusters=clusters,
@@ -214,8 +420,10 @@ class CrowdDensityPipeline:
         - position_source = "head"
         - occlusion_type = OcclusionType.NESSUNA
 
-        Se l'omografia non è calibrata, ground_position sarà None
-        e verrà loggato un warning.
+        Se l'omografia non è calibrata, usa le coordinate pixel del centro
+        della testa come fallback per ground_position. In questo modo il
+        tracking, il clustering e la density map funzionano anche senza
+        calibrazione (le coordinate saranno in pixel anziché in metri).
 
         Args:
             head_detections: Lista delle teste rilevate.
@@ -224,11 +432,12 @@ class CrowdDensityPipeline:
             Lista di FusedDetection pronte per il tracking.
         """
         calibrated = self._is_homography_calibrated()
-        if not calibrated and head_detections:
-            logger.warning(
-                "Omografia non calibrata: le posizioni ground non saranno disponibili. "
-                "Calibrare il modulo omografico per abilitare la proiezione."
+        if not calibrated and head_detections and not self._pixel_fallback_warned:
+            logger.info(
+                "Omografia non calibrata: uso coordinate pixel come fallback. "
+                "Clustering e density map opereranno in pixel."
             )
+            self._pixel_fallback_warned = True
 
         fused: list[FusedDetection] = []
         for head in head_detections:
@@ -237,12 +446,17 @@ class CrowdDensityPipeline:
                 try:
                     ground_position = self._homography.image_to_ground(head.center)
                 except ValueError:
-                    # Non dovrebbe accadere se calibrated == True, ma gestisci
                     logger.warning(
                         "Errore nella proiezione omografica per punto (%f, %f)",
                         head.center.x,
                         head.center.y,
                     )
+
+            # Fallback: usa coordinate pixel del centro testa
+            if ground_position is None:
+                ground_position = GroundPoint(
+                    x=head.center.x, y=head.center.y
+                )
 
             fused.append(
                 FusedDetection(
@@ -251,7 +465,7 @@ class CrowdDensityPipeline:
                     confidence=head.confidence,
                     occlusion_type=OcclusionType.NESSUNA,
                     ground_position=ground_position,
-                    position_source="head",
+                    position_source="head_pixel" if not calibrated else "head",
                 )
             )
 

@@ -43,8 +43,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--calibration",
         type=str,
-        required=True,
-        help="Percorso al file JSON di calibrazione (almeno 4 punti).",
+        default=None,
+        help="Percorso al file JSON di calibrazione (almeno 4 punti). "
+        "Se omesso, la pipeline opera in coordinate pixel.",
     )
     parser.add_argument(
         "--temporal-window",
@@ -80,6 +81,26 @@ def parse_args() -> argparse.Namespace:
         "--no-display",
         action="store_true",
         help="Non mostrare la finestra cv2.imshow.",
+    )
+    parser.add_argument(
+        "--bg-filter",
+        action="store_true",
+        help="Abilita il filtro background subtraction per escludere "
+        "oggetti statici (es. statue). Usa i primi --bg-frames frame "
+        "per costruire il modello di sfondo.",
+    )
+    parser.add_argument(
+        "--bg-frames",
+        type=int,
+        default=60,
+        help="Numero di frame per costruire il modello di sfondo (default: 60).",
+    )
+    parser.add_argument(
+        "--bg-image",
+        type=str,
+        default=None,
+        help="Percorso a un'immagine di sfondo pre-calcolata (PNG/JPG). "
+        "Se fornito, salta il warmup e usa direttamente questa immagine.",
     )
 
     return parser.parse_args()
@@ -160,18 +181,19 @@ def draw_frame_overlay(frame: np.ndarray, result: FrameResult) -> np.ndarray:
         Frame con overlay disegnato.
     """
     overlay = frame.copy()
+    h = overlay.shape[0]
 
-    # Informazioni di conteggio
-    count_text = f"Conteggio: {result.count_result.total_count:.1f}"
+    # Informazioni di conteggio — in basso a sinistra
+    count_text = f"Conteggio: {result.count_result.total_count:.0f}"
     cv2.putText(
-        overlay, count_text, (10, 30),
+        overlay, count_text, (10, h - 50),
         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
     )
 
-    # Numero di tracciati
-    tracked_text = f"Tracciati: {len(result.tracked_persons)}"
+    # Numero di rilevamenti nel frame
+    tracked_text = f"Rilevamenti: {len(result.head_detections)}"
     cv2.putText(
-        overlay, tracked_text, (10, 60),
+        overlay, tracked_text, (10, h - 20),
         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2,
     )
 
@@ -179,7 +201,7 @@ def draw_frame_overlay(frame: np.ndarray, result: FrameResult) -> np.ndarray:
     if result.alarms:
         alarm_text = f"ALLARMI: {len(result.alarms)}"
         cv2.putText(
-            overlay, alarm_text, (10, 90),
+            overlay, alarm_text, (10, h - 80),
             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
         )
 
@@ -208,15 +230,19 @@ def main() -> None:
         logger.error("File video non trovato: %s", args.video)
         sys.exit(1)
 
-    # Caricare calibrazione da JSON
-    logger.info("Caricamento calibrazione da: %s", args.calibration)
-    try:
-        correspondences, scene_bounds = load_calibration(args.calibration)
-    except (FileNotFoundError, ValueError, json.JSONDecodeError) as e:
-        logger.error("Errore nel caricamento della calibrazione: %s", e)
-        sys.exit(1)
-
-    logger.info("Calibrazione caricata: %d punti di corrispondenza", len(correspondences))
+    # Caricare calibrazione da JSON (se fornita)
+    correspondences = None
+    scene_bounds = None
+    if args.calibration:
+        logger.info("Caricamento calibrazione da: %s", args.calibration)
+        try:
+            correspondences, scene_bounds = load_calibration(args.calibration)
+        except (FileNotFoundError, ValueError, json.JSONDecodeError) as e:
+            logger.error("Errore nel caricamento della calibrazione: %s", e)
+            sys.exit(1)
+        logger.info("Calibrazione caricata: %d punti di corrispondenza", len(correspondences))
+    else:
+        logger.info("Nessuna calibrazione fornita: la pipeline opererà in coordinate pixel.")
 
     # Configurazione pipeline
     tracking_config = TrackingConfig(
@@ -246,21 +272,28 @@ def main() -> None:
     # Creare pipeline
     pipeline = CrowdDensityPipeline(config=config)
 
-    # Calibrare omografia manuale (Req 12.4)
-    logger.info("Calibrazione omografia manuale con %d punti...", len(correspondences))
-    try:
-        homography_module = HomographyModule.calibrate_manual(
-            correspondences=correspondences,
-            scene_bounds=scene_bounds,
-        )
-        # Impostare la matrice calcolata nel modulo della pipeline
-        pipeline.homography._homography_matrix = homography_module.homography_matrix
-        if scene_bounds is not None:
-            pipeline.homography.scene_bounds = scene_bounds
-        logger.info("Calibrazione omografia completata con successo.")
-    except ValueError as e:
-        logger.error("Errore nella calibrazione omografica: %s", e)
-        sys.exit(1)
+    # Calibrare omografia manuale (se calibrazione fornita)
+    if correspondences is not None:
+        logger.info("Calibrazione omografia manuale con %d punti...", len(correspondences))
+        try:
+            homography_module = HomographyModule.calibrate_manual(
+                correspondences=correspondences,
+                scene_bounds=scene_bounds,
+            )
+            # Impostare la matrice calcolata nel modulo della pipeline
+            pipeline.homography._homography_matrix = homography_module.homography_matrix
+            if scene_bounds is not None:
+                pipeline.homography.scene_bounds = scene_bounds
+            logger.info("Calibrazione omografia completata con successo.")
+        except ValueError as e:
+            logger.error("Errore nella calibrazione omografica: %s", e)
+            sys.exit(1)
+
+    # Abilitare filtro background se richiesto
+    if args.bg_image:
+        pipeline.enable_background_filter_from_image(image_path=args.bg_image)
+    elif args.bg_filter:
+        pipeline.enable_background_filter(warmup_frames=args.bg_frames)
 
     # Inizializzare video writer se richiesto
     video_writer = None
@@ -308,7 +341,17 @@ def main() -> None:
                         video_writer.write(frame_overlay)
 
                     if not args.no_display:
-                        cv2.imshow("Crowd Density Estimation", frame_overlay)
+                        # Ridimensiona per la visualizzazione se il frame è troppo grande
+                        display_frame = frame_overlay
+                        max_display_width = 960
+                        h_disp, w_disp = display_frame.shape[:2]
+                        if w_disp > max_display_width:
+                            scale = max_display_width / w_disp
+                            display_frame = cv2.resize(
+                                display_frame,
+                                (max_display_width, int(h_disp * scale)),
+                            )
+                        cv2.imshow("Crowd Density Estimation", display_frame)
                         key = cv2.waitKey(1) & 0xFF
                         if key == ord("q") or key == 27:  # 'q' o ESC
                             logger.info("Interruzione utente (tasto premuto).")

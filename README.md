@@ -18,6 +18,15 @@ Il progetto implementa un approccio a **due livelli** per il conteggio e il trac
 - Rilevamento assembramenti con allarmi configurabili
 - Gestione dell'occlusione ambientale (colonne, statue) e interpersonale
 
+## modelli utilizzabili 
+Modello	Dimensione	Velocità	Precisione	Comando
+YOLOv8n (attuale)	6 MB	Più veloce	Base	yolov8n.pt
+YOLOv8s	22 MB	Veloce	Migliore	yolov8s.pt
+YOLOv8m	50 MB	Medio	Buona	yolov8m.pt
+YOLOv8l	84 MB	Lento	Alta	yolov8l.pt
+YOLOv8x	131 MB	Più lento	Massima	yolov8x.pt
+
+
 ## Struttura del progetto
 
 ```
