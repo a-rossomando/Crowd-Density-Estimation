@@ -36,6 +36,7 @@ Crowd-Density-Estimation/
 ├── yolov8n.pt                 # Modello YOLOv8 pre-addestrato
 ├── crowd_density/             # Package principale
 │   ├── __init__.py
+│   ├── background.py          # Filtro background subtraction (statue/oggetti statici)
 │   ├── config.py              # Configurazione e validazione parametri
 │   ├── detection.py           # Localizzazione teste
 │   ├── tracking.py            # Macchina a stati temporale
@@ -65,6 +66,7 @@ Crowd-Density-Estimation/
 - NumPy
 - scikit-learn
 - Matplotlib
+- SciPy
 
 ## Installazione
 
@@ -86,7 +88,7 @@ pip install -r requirements.txt
 
 ### Calibrazione
 
-Prima dell'esecuzione è necessario un file JSON di calibrazione con almeno 4 punti di corrispondenza tra coordinate pixel e coordinate nel piano del suolo:
+Per abilitare la proiezione sul piano del suolo è possibile fornire un file JSON di calibrazione con almeno 4 punti di corrispondenza tra coordinate pixel e coordinate metriche:
 
 ```json
 {
@@ -100,10 +102,16 @@ Prima dell'esecuzione è necessario un file JSON di calibrazione con almeno 4 pu
 }
 ```
 
+Se il file di calibrazione non viene fornito, la pipeline opera in coordinate pixel.
+
 ### Esecuzione
 
 ```bash
+# Con calibrazione (proiezione sul piano del suolo)
 python main.py --video percorso/al/video.mp4 --calibration percorso/calibrazione.json
+
+# Senza calibrazione (coordinate pixel)
+python main.py --video percorso/al/video.mp4
 ```
 
 ### Opzioni CLI
@@ -111,17 +119,21 @@ python main.py --video percorso/al/video.mp4 --calibration percorso/calibrazione
 | Argomento | Default | Descrizione |
 |-----------|---------|-------------|
 | `--video` | *(obbligatorio)* | Percorso al file video (MP4, AVI, MOV) |
-| `--calibration` | *(obbligatorio)* | Percorso al file JSON di calibrazione |
+| `--calibration` | `None` | Percorso al file JSON di calibrazione. Se omesso, la pipeline opera in coordinate pixel |
 | `--temporal-window` | `5.0` | Finestra temporale in secondi (range: 1–60) |
 | `--cluster-radius` | `2.0` | Raggio di clustering in metri (range: 0.5–5.0) |
 | `--density-threshold` | `1.0` | Soglia densità per assembramento (persone/m²) |
 | `--critical-threshold` | `2.0` | Soglia critica per allarme (deve essere > density-threshold) |
 | `--output` | `None` | Percorso per salvare il video di output |
 | `--no-display` | `False` | Non mostrare la finestra di visualizzazione |
+| `--bg-filter` | `False` | Abilita il filtro background subtraction per escludere oggetti statici (es. statue). Usa i primi N frame per costruire il modello di sfondo |
+| `--bg-frames` | `60` | Numero di frame per costruire il modello di sfondo (usato con `--bg-filter`) |
+| `--bg-image` | `None` | Percorso a un'immagine di sfondo pre-calcolata (PNG/JPG). Se fornito, salta il warmup e usa direttamente questa immagine |
 
 ### Esempio
 
 ```bash
+# Esecuzione base con calibrazione
 python main.py \
   --video sala_museo.mp4 \
   --calibration calibrazione_sala.json \
@@ -130,7 +142,33 @@ python main.py \
   --density-threshold 0.8 \
   --critical-threshold 1.5 \
   --output risultato.mp4
+
+# Con filtro background (costruisce il modello dai primi 90 frame)
+python main.py \
+  --video sala_museo.mp4 \
+  --calibration calibrazione_sala.json \
+  --bg-filter \
+  --bg-frames 90 \
+  --output risultato.mp4
+
+# Con immagine di sfondo pre-calcolata (salta il warmup)
+python main.py \
+  --video sala_museo.mp4 \
+  --calibration calibrazione_sala.json \
+  --bg-image background_model.png \
+  --output risultato.mp4
 ```
+
+## Filtro Background Subtraction
+
+In ambienti museali con statue o manichini, il detector YOLO può rilevare erroneamente oggetti statici a forma umana. Il filtro background subtraction risolve questo problema:
+
+1. **Warmup automatico** (`--bg-filter`): accumula i primi N frame (default 60) e calcola la mediana per costruire un modello di sfondo. Durante il warmup le detection vengono sospese.
+2. **Immagine pre-calcolata** (`--bg-image`): carica direttamente un'immagine di sfondo (generata da un'esecuzione precedente o catturata manualmente), saltando il warmup.
+
+Per ogni detection, il filtro confronta la regione corrispondente nel frame corrente con lo sfondo. Se la differenza è troppo bassa (regione statica), la detection viene scartata.
+
+Quando si usa `--bg-filter`, il modello di sfondo viene salvato automaticamente in `background_model.png` per poterlo riutilizzare con `--bg-image` nelle esecuzioni successive.
 
 ## Test
 
