@@ -1,3 +1,7 @@
 *.png
 *.pt
 __pycache__/
+presentazione.md
+relazione.md
+*.pdf
+*.mp4
